@@ -19,6 +19,7 @@ const PORT = Number(process.env.PORT || 3000);
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, '..', 'uploads');
 const JUMP_THRESHOLD_M = Number(process.env.JUMP_THRESHOLD_M || 0.3);
 const EVENT_KINDS = new Set(['debris', 'outfall']);
+const READING_FIELDS = ['walked_at', 'level_m', 'water_color', 'flow_ms', 'note'];
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -41,6 +42,7 @@ app.use('/uploads', express.static(UPLOAD_DIR));
 
 const asyncH = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const bad = (res, msg) => res.status(400).json({ error: msg });
+const badRequest = (msg) => Object.assign(new Error(msg), { statusCode: 400 });
 const round3 = (n) => Math.round(n * 1000) / 1000;
 
 // ---------- 小工具 ----------
@@ -48,6 +50,11 @@ const round3 = (n) => Math.round(n * 1000) / 1000;
 function toNum(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+function toId(v) {
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : null;
 }
 
 /** 'YYYY-MM-DDTHH:MM' 或 'YYYY-MM-DD HH:MM[:SS]' → 'YYYY-MM-DD HH:MM:SS'，不合法返回 null */
@@ -67,6 +74,7 @@ function normalizeReading(r) {
     level_m: Number(r.level_m),
     flow_ms: r.flow_ms === null ? null : Number(r.flow_ms),
     verified: Boolean(r.verified),
+    is_void: Boolean(r.is_void),
   };
 }
 
@@ -74,40 +82,139 @@ function normalizeEvent(e) {
   return { ...e, x: Number(e.x), y: Number(e.y) };
 }
 
-/** 按断面分组、按时间排序的全部读数（跳变计算要跨日期看相邻两次，所以不过滤日期） */
-async function fetchReadingsOrdered(sectionId) {
+/** 按断面分组、按时间排序的读数；跳变计算只取有效记录，历史回看连作废条一起返回 */
+async function fetchReadingsOrdered(sectionId, { includeVoided = true } = {}) {
   let sql = `
     SELECT r.id, r.section_id, s.code AS section_code, s.name AS section_name,
            r.walked_at, r.walked_by, r.level_m, r.water_color, r.flow_ms, r.note,
-           r.verified, r.verify_note, r.verified_at
+           r.verified, r.verify_note, r.verified_at,
+           r.is_void, r.void_reason, r.voided_at, r.voided_by,
+           r.revised_at, r.revised_by, r.created_at
     FROM readings r
     JOIN sections s ON s.id = r.section_id`;
   const params = [];
   if (sectionId) {
     sql += ' WHERE r.section_id = ?';
     params.push(Number(sectionId));
+    if (!includeVoided) sql += ' AND r.is_void = 0';
+  } else if (!includeVoided) {
+    sql += ' WHERE r.is_void = 0';
   }
   sql += ' ORDER BY r.section_id, r.walked_at, r.id';
   const [rows] = await pool.query(sql, params);
   return rows.map(normalizeReading);
 }
 
-/** 给每行补上 prev_level_m / delta_m / jump（与同一断面上一次读数比） */
+/** 给每行补上 prev_level_m / delta_m / jump（与同一断面上一次有效读数比） */
 function annotateJumps(rows, threshold) {
   let prev = null;
   for (const r of rows) {
-    if (prev && prev.section_id === r.section_id) {
+    if (r.is_void || !prev || prev.section_id !== r.section_id) {
+      if (!r.is_void) {
+        r.prev_level_m = null;
+        r.delta_m = null;
+        r.jump = false;
+      }
+    } else {
       r.prev_level_m = prev.level_m;
       r.delta_m = round3(r.level_m - prev.level_m);
       r.jump = Math.abs(r.delta_m) > threshold; // 差正好等于阈值不算跳变
-    } else {
-      r.prev_level_m = null;
-      r.delta_m = null;
-      r.jump = false;
     }
-    prev = r;
+    if (!r.is_void) prev = r;
   }
   return rows;
+}
+
+/** 老库没有迁移目录，启动时幂等补齐“作废 / 修改留痕”结构 */
+async function ensureSchema() {
+  const columns = [
+    ['is_void', "TINYINT(1) NOT NULL DEFAULT 0"],
+    ['void_reason', "VARCHAR(200) NOT NULL DEFAULT ''"],
+    ['voided_at', 'DATETIME DEFAULT NULL'],
+    ['voided_by', 'VARCHAR(20) DEFAULT NULL'],
+    ['revised_at', 'DATETIME DEFAULT NULL'],
+    ['revised_by', 'VARCHAR(20) DEFAULT NULL'],
+  ];
+  for (const [name, ddl] of columns) {
+    const [found] = await pool.query(
+      `SELECT 1 FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'readings' AND COLUMN_NAME = ?`,
+      [name]
+    );
+    if (!found.length) await pool.query(`ALTER TABLE readings ADD COLUMN ${name} ${ddl}`);
+  }
+
+  const [idx] = await pool.query(
+    `SELECT 1 FROM information_schema.STATISTICS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'readings' AND INDEX_NAME = 'idx_section_valid'`
+  );
+  if (!idx.length) {
+    await pool.query('ALTER TABLE readings ADD INDEX idx_section_valid (section_id, is_void, walked_at)');
+  }
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reading_revisions (
+      id             INT AUTO_INCREMENT PRIMARY KEY,
+      reading_id     INT NOT NULL,
+      action         VARCHAR(20) NOT NULL,
+      changed_fields JSON DEFAULT NULL,
+      reason         VARCHAR(200) NOT NULL DEFAULT '',
+      revised_by     VARCHAR(20) NOT NULL,
+      revised_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_reading_time (reading_id, id),
+      FOREIGN KEY (reading_id) REFERENCES readings(id)
+    )
+  `);
+}
+
+const sameNullableNumber = (a, b) => (
+  a === null || b === null ? a === b : Number(a) === Number(b)
+);
+
+async function addRevision(conn, readingId, action, changedFields, revisedBy, reason = '') {
+  await conn.query(
+    `INSERT INTO reading_revisions
+       (reading_id, action, changed_fields, reason, revised_by)
+     VALUES (?,?,?,?,?)`,
+    [readingId, action, changedFields ? JSON.stringify(changedFields) : null, reason, revisedBy]
+  );
+}
+
+/** 取某断面仍有效的相邻签名；FOR UPDATE 让同断面的保存/作废串行处理 */
+async function validPairsForUpdate(conn, sectionId) {
+  const [rows] = await conn.query(
+    `SELECT id, walked_at, level_m, is_void
+     FROM readings WHERE section_id = ?
+     ORDER BY walked_at, id
+     FOR UPDATE`,
+    [sectionId]
+  );
+  const valid = rows.filter((r) => !Number(r.is_void));
+  const pairs = new Map();
+  valid.forEach((r, i) => {
+    const prev = valid[i - 1] || null;
+    pairs.set(r.id, prev
+      ? `${prev.id}|${prev.walked_at}|${prev.level_m}|${r.walked_at}|${r.level_m}`
+      : `first|${r.walked_at}|${r.level_m}`);
+  });
+  return pairs;
+}
+
+/** 保存、修改、作废/恢复后，只清“相邻配对真的变了”的旧核实勾 */
+async function resetChangedVerifications(conn, sectionId, beforePairs) {
+  const afterPairs = await validPairsForUpdate(conn, sectionId);
+  const ids = new Set([...beforePairs.keys(), ...afterPairs.keys()]);
+  const clearIds = [];
+  for (const id of ids) {
+    if (beforePairs.get(id) !== afterPairs.get(id)) clearIds.push(id);
+  }
+  if (!clearIds.length) return;
+  await conn.query(
+    `UPDATE readings
+     SET verified = 0, verify_note = '', verified_at = NULL
+     WHERE id IN (?)`,
+    [clearIds]
+  );
 }
 
 // ---------- 基础 ----------
@@ -136,7 +243,7 @@ app.get('/api/sketch', asyncH(async (req, res) => {
 // 巡测人历史名单（前端 datalist 用，三个人轮流跑，名字不用维护表）
 app.get('/api/walkers', asyncH(async (req, res) => {
   const [rows] = await pool.query(
-    'SELECT DISTINCT walked_by FROM readings ORDER BY walked_by LIMIT 50'
+    'SELECT DISTINCT walked_by FROM readings WHERE is_void = 0 ORDER BY walked_by LIMIT 50'
   );
   res.json(rows.map((r) => r.walked_by));
 }));
@@ -162,14 +269,29 @@ app.post('/api/readings', asyncH(async (req, res) => {
   const [sec] = await pool.query('SELECT id FROM sections WHERE id = ?', [sectionId]);
   if (!sec.length) return bad(res, '断面不存在');
 
-  const [r] = await pool.query(
-    'INSERT INTO readings (section_id, walked_at, walked_by, level_m, water_color, flow_ms, note) VALUES (?,?,?,?,?,?,?)',
-    [sectionId, walkedAt, walkedBy, level, waterColor, flow, note]
-  );
+  const conn = await pool.getConnection();
+  let insertId;
+  try {
+    await conn.beginTransaction();
+    const beforePairs = await validPairsForUpdate(conn, sectionId);
+    const [r] = await conn.query(
+      'INSERT INTO readings (section_id, walked_at, walked_by, level_m, water_color, flow_ms, note) VALUES (?,?,?,?,?,?,?)',
+      [sectionId, walkedAt, walkedBy, level, waterColor, flow, note]
+    );
+    insertId = r.insertId;
+    await resetChangedVerifications(conn, sectionId, beforePairs);
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+
   const [rows] = await pool.query(
     `SELECT r.*, s.code AS section_code, s.name AS section_name
      FROM readings r JOIN sections s ON s.id = r.section_id WHERE r.id = ?`,
-    [r.insertId]
+    [insertId]
   );
   res.status(201).json(normalizeReading(rows[0]));
 }));
@@ -199,7 +321,7 @@ app.get('/api/readings', asyncH(async (req, res) => {
 // 跳变清单：同一断面相邻两次水位差 > 阈值（默认 30cm，差正好 30cm 不算），单独挑出来追问是否抄串
 app.get('/api/jumps', asyncH(async (req, res) => {
   const threshold = toNum(req.query.threshold) || JUMP_THRESHOLD_M;
-  const rows = await fetchReadingsOrdered(req.query.section_id);
+  const rows = await fetchReadingsOrdered(req.query.section_id, { includeVoided: false });
   const pairs = [];
   let prev = null;
   for (const r of rows) {
@@ -221,15 +343,171 @@ app.get('/api/jumps', asyncH(async (req, res) => {
   res.json(pairs);
 }));
 
+// 修改一条读数：只改抄录内容，不改断面和原始巡测人；配对变化时旧核实自动失效
+app.patch('/api/readings/:id', asyncH(async (req, res) => {
+  const id = toId(req.params.id);
+  if (!id) return bad(res, '读数不存在');
+  const revisedBy = str(req.body.revised_by, 20);
+  if (!revisedBy) return bad(res, '填一下操作人');
+
+  const next = {};
+  if (Object.prototype.hasOwnProperty.call(req.body, 'walked_at')) {
+    next.walked_at = normDateTime(req.body.walked_at);
+    if (!next.walked_at) return bad(res, '巡测时间格式不对');
+  }
+  if (Object.prototype.hasOwnProperty.call(req.body, 'level_m')) {
+    next.level_m = toNum(req.body.level_m);
+    if (next.level_m === null || next.level_m < -10 || next.level_m > 100) {
+      return bad(res, '水位读数不对（米）');
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(req.body, 'water_color')) {
+    next.water_color = str(req.body.water_color, 20);
+  }
+  if (Object.prototype.hasOwnProperty.call(req.body, 'flow_ms')) {
+    next.flow_ms = req.body.flow_ms === null || req.body.flow_ms === ''
+      ? null
+      : toNum(req.body.flow_ms);
+    if (next.flow_ms !== null && (next.flow_ms < 0 || next.flow_ms > 20)) {
+      return bad(res, '目估流速不对（m/s）');
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(req.body, 'note')) {
+    next.note = str(req.body.note, 200);
+  }
+  const unknown = Object.keys(req.body).filter((k) => !['walked_at', 'level_m', 'water_color', 'flow_ms', 'note', 'revised_by'].includes(k));
+  if (unknown.length) return bad(res, `不能修改：${unknown.join('、')}`);
+  if (!Object.keys(next).length) return bad(res, '没有要修改的内容');
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [found] = await conn.query('SELECT * FROM readings WHERE id = ? FOR UPDATE', [id]);
+    if (!found.length) throw badRequest('读数不存在');
+    const old = found[0];
+    if (Number(old.is_void)) throw badRequest('已作废的记录不能直接修改；先恢复再改');
+
+    const changed = {};
+    if (next.walked_at !== undefined && next.walked_at !== old.walked_at) {
+      changed.walked_at = { old: old.walked_at, new: next.walked_at };
+    }
+    if (next.level_m !== undefined && Number(next.level_m) !== Number(old.level_m)) {
+      changed.level_m = { old: Number(old.level_m), new: next.level_m };
+    }
+    if (next.water_color !== undefined && next.water_color !== old.water_color) {
+      changed.water_color = { old: old.water_color, new: next.water_color };
+    }
+    if (next.flow_ms !== undefined && !sameNullableNumber(next.flow_ms, old.flow_ms)) {
+      changed.flow_ms = {
+        old: old.flow_ms === null ? null : Number(old.flow_ms),
+        new: next.flow_ms,
+      };
+    }
+    if (next.note !== undefined && next.note !== old.note) {
+      changed.note = { old: old.note, new: next.note };
+    }
+    if (!Object.keys(changed).length) throw badRequest('内容没有变化');
+
+    const beforePairs = await validPairsForUpdate(conn, old.section_id);
+    const fields = Object.keys(next);
+    const assignments = fields.map((f) => `${f} = ?`).join(', ');
+    const values = fields.map((f) => next[f]);
+    await conn.query(
+      `UPDATE readings SET ${assignments}, revised_at = NOW(), revised_by = ? WHERE id = ?`,
+      [...values, revisedBy, id]
+    );
+    await addRevision(conn, id, 'edit', changed, revisedBy);
+    await resetChangedVerifications(conn, old.section_id, beforePairs);
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+  res.json({ ok: true });
+}));
+
+// 作废 / 恢复：作废条仍在历史里，但不占“相邻两次”；原因和操作人进流水
+app.patch('/api/readings/:id/void', asyncH(async (req, res) => {
+  const id = toId(req.params.id);
+  const makeVoid = req.body.is_void !== false;
+  const revisedBy = str(req.body.revised_by, 20);
+  const reason = str(req.body.reason, 200);
+  if (!id) return bad(res, '读数不存在');
+  if (!revisedBy) return bad(res, '填一下操作人');
+  if (makeVoid && !reason) return bad(res, '作废必须写原因');
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [found] = await conn.query('SELECT * FROM readings WHERE id = ? FOR UPDATE', [id]);
+    if (!found.length) throw badRequest('读数不存在');
+    const old = found[0];
+    const alreadyVoid = Boolean(Number(old.is_void));
+    if (makeVoid === alreadyVoid) throw badRequest(makeVoid ? '这条已经作废' : '这条不是作废状态');
+
+    const beforePairs = await validPairsForUpdate(conn, old.section_id);
+    if (makeVoid) {
+      await conn.query(
+        `UPDATE readings
+         SET is_void = 1, void_reason = ?, voided_at = NOW(), voided_by = ?,
+             verified = 0, verify_note = '', verified_at = NULL,
+             revised_at = NOW(), revised_by = ?
+         WHERE id = ?`,
+        [reason, revisedBy, revisedBy, id]
+      );
+      await addRevision(conn, id, 'void', { is_void: { old: 0, new: 1 } }, revisedBy, reason);
+    } else {
+      await conn.query(
+        `UPDATE readings
+         SET is_void = 0, void_reason = '', voided_at = NULL, voided_by = NULL,
+             revised_at = NOW(), revised_by = ?
+         WHERE id = ?`,
+        [revisedBy, id]
+      );
+      await addRevision(conn, id, 'restore', { is_void: { old: 1, new: 0 } }, revisedBy, reason);
+    }
+    await resetChangedVerifications(conn, old.section_id, beforePairs);
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+  res.json({ ok: true });
+}));
+
+// 一条读数的修改/作废流水
+app.get('/api/readings/:id/revisions', asyncH(async (req, res) => {
+  const id = toId(req.params.id);
+  if (!id) return bad(res, '读数不存在');
+  const [rows] = await pool.query(
+    `SELECT id, reading_id, action, changed_fields, reason, revised_by, revised_at
+     FROM reading_revisions WHERE reading_id = ? ORDER BY id DESC`,
+    [id]
+  );
+  res.json(rows.map((x) => ({
+    ...x,
+    changed_fields: typeof x.changed_fields === 'string' ? JSON.parse(x.changed_fields) : x.changed_fields,
+  })));
+}));
+
 // 追问完了标记：已核实 / 取消核实
 app.patch('/api/readings/:id/verify', asyncH(async (req, res) => {
+  const id = toId(req.params.id);
+  if (!id) return bad(res, '读数不存在');
+  const [found] = await pool.query('SELECT id, is_void FROM readings WHERE id = ?', [id]);
+  if (!found.length) return bad(res, '读数不存在');
+  if (Number(found[0].is_void)) return bad(res, '作废记录不参与跳变核实');
+
   const verified = req.body.verified ? 1 : 0;
   const note = str(req.body.verify_note, 200);
-  const [r] = await pool.query(
+  await pool.query(
     'UPDATE readings SET verified = ?, verify_note = ?, verified_at = IF(? = 1, NOW(), NULL) WHERE id = ?',
-    [verified, note, verified, req.params.id]
+    [verified, note, verified, id]
   );
-  if (!r.affectedRows) return bad(res, '读数不存在');
   res.json({ ok: true });
 }));
 
@@ -309,6 +587,7 @@ app.post('/api/events/:id/photo', upload.single('photo'), asyncH(async (req, res
 app.use((err, req, res, next) => {
   if (err && err.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: '照片超过 10M' });
   if (err && err.message === '只收图片文件') return res.status(400).json({ error: err.message });
+  if (err && err.statusCode) return res.status(err.statusCode).json({ error: err.message });
   console.error(err);
   res.status(500).json({ error: '服务器内部错误' });
 });
@@ -328,7 +607,8 @@ async function waitForDb(retries = 30) {
   throw new Error('数据库连不上，放弃启动');
 }
 
-waitForDb().then(() => {
+waitForDb().then(async () => {
+  await ensureSchema();
   app.listen(PORT, () => console.log(`section-svc 监听 :${PORT}，跳变阈值 ${JUMP_THRESHOLD_M}m`));
 }).catch((e) => {
   console.error(e.message);

@@ -31,6 +31,9 @@ export const api = {
 
   saveReading: (body) => req('/api/readings', json('POST', body)),
   readings: (params) => req('/api/readings' + qs(params)),
+  updateReading: (id, body) => req(`/api/readings/${id}`, json('PATCH', body)),
+  setVoidReading: (id, body) => req(`/api/readings/${id}/void`, json('PATCH', body)),
+  revisions: (id) => req(`/api/readings/${id}/revisions`),
   verify: (id, body) => req(`/api/readings/${id}/verify`, json('PATCH', body)),
 
   events: (params) => req('/api/events' + qs(params)),

@@ -35,13 +35,33 @@ CREATE TABLE IF NOT EXISTS readings (
   water_color VARCHAR(20) NOT NULL DEFAULT '',   -- 水色
   flow_ms     DECIMAL(4,2) DEFAULT NULL,         -- 目估流速 m/s
   note        VARCHAR(200) NOT NULL DEFAULT '',
-  verified    TINYINT(1) NOT NULL DEFAULT 0,     -- 跳变核实标记
-  verify_note VARCHAR(200) NOT NULL DEFAULT '',
-  verified_at DATETIME DEFAULT NULL,
-  created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  verified      TINYINT(1) NOT NULL DEFAULT 0,   -- 跳变核实标记（配对一变就回待追问）
+  verify_note   VARCHAR(200) NOT NULL DEFAULT '',
+  verified_at   DATETIME DEFAULT NULL,
+  is_void       TINYINT(1) NOT NULL DEFAULT 0,   -- 作废：保留历史，但不参与相邻比较
+  void_reason   VARCHAR(200) NOT NULL DEFAULT '',
+  voided_at     DATETIME DEFAULT NULL,
+  voided_by     VARCHAR(20) DEFAULT NULL,
+  revised_at    DATETIME DEFAULT NULL,
+  revised_by    VARCHAR(20) DEFAULT NULL,
+  created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_section_time (section_id, walked_at),
+  INDEX idx_section_valid (section_id, is_void, walked_at),
   INDEX idx_walked_at (walked_at),
   FOREIGN KEY (section_id) REFERENCES sections(id)
+);
+
+-- 读数修改流水：三班次都能看见谁改过、谁作废过，旧值也留痕
+CREATE TABLE IF NOT EXISTS reading_revisions (
+  id             INT AUTO_INCREMENT PRIMARY KEY,
+  reading_id     INT NOT NULL,
+  action         VARCHAR(20) NOT NULL,           -- edit / void / restore
+  changed_fields JSON DEFAULT NULL,              -- {字段: {old,new}}
+  reason         VARCHAR(200) NOT NULL DEFAULT '',
+  revised_by     VARCHAR(20) NOT NULL,
+  revised_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_reading_time (reading_id, id),
+  FOREIGN KEY (reading_id) REFERENCES readings(id)
 );
 
 -- 简图标注：漂浮物 / 疑似排污口，挂在某次读数上，照片存文件、库里存路径
