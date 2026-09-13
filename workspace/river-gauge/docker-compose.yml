@@ -1,0 +1,67 @@
+# river-gauge：巡河记录（页 + 接口 + 库）
+# 站里电脑只要装 Docker，执行：docker compose up -d --build
+# 然后浏览器开 http://localhost:8081 （或 http://本机IP:8081 给另外两个人用）
+
+services:
+  db:
+    image: mysql:8.0
+    container_name: rg-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-river123}
+      MYSQL_DATABASE: river_gauge
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - db-data:/var/lib/mysql
+      # 只在数据库第一次初始化时执行；改了这个文件要 docker compose down -v 后重建才生效
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [rg]
+    # 不对外暴露 3306，只在内部网络给 section-svc 用
+
+  section-svc:
+    build: ./section-svc
+    container_name: rg-svc
+    restart: unless-stopped
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      DB_USER: root
+      DB_PASSWORD: ${DB_ROOT_PASSWORD:-river123}
+      DB_NAME: river_gauge
+      UPLOAD_DIR: /data/uploads
+      JUMP_THRESHOLD_M: "0.3"   # 相邻两次水位差超过 30cm 挑出
+      TZ: Asia/Shanghai
+    volumes:
+      - uploads:/data/uploads    # 现场照片
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [rg]
+
+  gateway:
+    # 唯一的 Nginx：页面静态文件 + /api、/uploads 反代到 section-svc，同一个端口出去
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
+    container_name: rg-gateway
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8081}:80"
+    depends_on:
+      - section-svc
+    networks: [rg]
+
+volumes:
+  db-data:
+  uploads:
+
+networks:
+  rg:
